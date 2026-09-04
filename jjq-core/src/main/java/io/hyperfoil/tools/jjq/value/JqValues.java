@@ -1171,6 +1171,92 @@ public final class JqValues {
         // share the keys[] array to reduce heap pressure and improve L1 cache locality.
         String[] previousKeys;
         int previousKeyCount;
+        private static final int SCHEMA_CACHE_SIZE = 8;
+        private final String[][] schemaCache = new String[SCHEMA_CACHE_SIZE][];
+        private int schemaCacheNext;
+
+        // Members of an object larger than CHUNK are collected in fixed-size chunks instead of a
+        // doubling array. Chunks are never resized, so they are reused by any object at any depth
+        // and retention is a count of uniform CHUNK-sized arrays. They are typed rather than
+        // Object[] so flattening uses the plain arraycopy stub: an Object[] chain forces
+        // checkcast_arraycopy, which measured 3.6% of cycles.
+        static final int CHUNK = 32;
+        static final int CHUNK_SHIFT = 5;
+        static final int CHUNK_MASK = CHUNK - 1;
+        // One spine of chunks per depth: an object nested inside another is at a deeper depth,
+        // so it cannot clobber its parent's chunks.
+        private String[][][] kChunks = new String[16][][];
+        private JqValue[][][] vChunks = new JqValue[16][][];
+
+        private void ensureDepth(int depth) {
+            if (depth >= kChunks.length) {
+                kChunks = java.util.Arrays.copyOf(kChunks, Math.max(depth + 1, kChunks.length * 2));
+                vChunks = java.util.Arrays.copyOf(vChunks, kChunks.length);
+            }
+            if (kChunks[depth] == null) { kChunks[depth] = new String[4][]; vChunks[depth] = new JqValue[4][]; }
+        }
+
+        String[] keyChunk(int depth, int i) {
+            ensureDepth(depth);
+            String[][] spine = kChunks[depth];
+            if (i >= spine.length) {
+                spine = java.util.Arrays.copyOf(spine, Math.max(i + 1, spine.length * 2));
+                kChunks[depth] = spine;
+                vChunks[depth] = java.util.Arrays.copyOf(vChunks[depth], spine.length);
+            }
+            String[] c = spine[i];
+            if (c == null) { c = new String[CHUNK]; spine[i] = c; }
+            return c;
+        }
+
+        JqValue[] valueChunk(int depth, int i) {
+            JqValue[] c = vChunks[depth][i];
+            if (c == null) { c = new JqValue[CHUNK]; vChunks[depth][i] = c; }
+            return c;
+        }
+
+        private boolean matchesChunks(String[] candidate, int depth, int count) {
+            if (candidate.length != count) return false;
+            String[][] spine = kChunks[depth];
+            for (int off = 0; off < count; off += CHUNK) {
+                String[] c = spine[off >>> CHUNK_SHIFT];
+                int n = Math.min(CHUNK, count - off);
+                for (int i = 0; i < n; i++) if (candidate[off + i] != c[i]) return false;
+            }
+            return true;
+        }
+
+        /** Sharing lookup against the chunks, so no key array is built on a hit. */
+        String[] findSharedKeysChunked(int depth, int count) {
+            String[] prev = previousKeys;
+            if (prev != null && matchesChunks(prev, depth, count)) return prev;
+            for (String[] c : schemaCache) {
+                if (c != null && matchesChunks(c, depth, count)) { previousKeys = c; return c; }
+            }
+            return null;
+        }
+
+        String[] findSharedKeys(String[] keys, int count) {
+            String[] prev = previousKeys;
+            if (prev != null && prev.length == count) {
+                int i = 0;
+                while (i < count && prev[i] == keys[i]) i++;
+                if (i == count) return prev;
+            }
+            for (String[] c : schemaCache) {
+                if (c == null || c.length != count) continue;
+                int i = 0;
+                while (i < count && c[i] == keys[i]) i++;
+                if (i == count) { previousKeys = c; return c; }
+            }
+            return null;
+        }
+
+        void rememberKeys(String[] exactKeys) {
+            previousKeys = exactKeys;
+            schemaCache[schemaCacheNext] = exactKeys;
+            schemaCacheNext = (schemaCacheNext + 1) & (SCHEMA_CACHE_SIZE - 1);
+        }
 
         JsonByteReader(byte[] data, int offset, int end) {
             this.data = data;
@@ -1378,36 +1464,68 @@ public final class JqValues {
         String[] keys = new String[8];
         JqValue[] values = new JqValue[8];
         int count = 0;
+        boolean chunked = false;
+        String[] kCur = null;
+        JqValue[] vCur = null;
         while (true) {
             r.skipWs();
             if (r.pos >= r.end || (r.data[r.pos] & 0xFF) != '"') {
                 throw new IllegalArgumentException("Expected '\"' for object key");
             }
-            if (count >= keys.length) {
-                keys = java.util.Arrays.copyOf(keys, keys.length * 2);
-                values = java.util.Arrays.copyOf(values, values.length * 2);
+            if (count == 8 && !chunked) {                   // spill the inline members into chunks
+                chunked = true;
+                kCur = r.keyChunk(depth, 0); vCur = r.valueChunk(depth, 0);
+                System.arraycopy(keys, 0, kCur, 0, 8);
+                System.arraycopy(values, 0, vCur, 0, 8);
             }
             // Keys interned for deduplication and reference equality in JqObject.get()
-            keys[count] = parseAndInternKeyBytes(r);
+            String key = parseAndInternKeyBytes(r);
             r.skipWs();
             r.pos++; // skip :
-            values[count] = parseValueBytes(r, depth);
+            JqValue value = parseValueBytes(r, depth);
+            if (!chunked) {
+                keys[count] = key;
+                values[count] = value;
+            } else {
+                int slot = count & JsonByteReader.CHUNK_MASK;
+                if (slot == 0) {
+                    int ci = count >>> JsonByteReader.CHUNK_SHIFT;
+                    kCur = r.keyChunk(depth, ci); vCur = r.valueChunk(depth, ci);
+                }
+                kCur[slot] = key;
+                vCur[slot] = value;
+            }
             count++;
             r.skipWs();
             if (r.pos >= r.end || (r.data[r.pos] & 0xFF) == '}') { r.pos++; break; }
             r.pos++; // skip ,
         }
-        // Key sharing: if this object has the same interned keys as the previous one,
-        // reuse the shared keys[] array. Saves ~1KB per object for 127-key PCP entries.
+        if (chunked) {
+            JqValue[] fv = new JqValue[count];
+            for (int off = 0; off < count; off += JsonByteReader.CHUNK) {
+                System.arraycopy(r.valueChunk(depth, off >>> JsonByteReader.CHUNK_SHIFT), 0, fv, off,
+                                 Math.min(JsonByteReader.CHUNK, count - off));
+            }
+            // Keys are only materialised when sharing misses.
+            String[] shared = r.findSharedKeysChunked(depth, count);
+            if (shared != null) return JqObject.ofArrays(shared, fv, count);
+            String[] fk = new String[count];
+            for (int off = 0; off < count; off += JsonByteReader.CHUNK) {
+                System.arraycopy(r.keyChunk(depth, off >>> JsonByteReader.CHUNK_SHIFT), 0, fk, off,
+                                 Math.min(JsonByteReader.CHUNK, count - off));
+            }
+            r.rememberKeys(fk);
+            return JqObject.ofArrays(fk, fv, count);
+        }
+
         // Reference equality is safe because all keys are interned.
-        String[] sharedKeys = tryShareKeys(keys, count, r.previousKeys, r.previousKeyCount);
+        String[] sharedKeys = r.findSharedKeys(keys, count);
         if (sharedKeys != null) {
             return JqObject.ofArrays(sharedKeys, values, count);
         }
-        // New schema — remember this key set for next comparison
-        r.previousKeys = java.util.Arrays.copyOf(keys, count);
-        r.previousKeyCount = count;
-        return JqObject.ofArrays(r.previousKeys, values, count);
+        String[] exactKeys = count != keys.length ? java.util.Arrays.copyOf(keys, count) : keys;
+        r.rememberKeys(exactKeys);
+        return JqObject.ofArrays(exactKeys, values, count);
     }
 
     /** Parse a JSON string value from bytes, returning a deferred JqString. */
